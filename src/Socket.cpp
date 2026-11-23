@@ -14,6 +14,9 @@
  * limitations under the License.
  */
 
+#include <algorithm>
+#include <cerrno>
+#include <cstring>
 #include <random>
 
 #include <znc/Socket.h>
@@ -44,7 +47,9 @@ CZNCSock::CZNCSock(int timeout)
     : Csock(timeout),
       m_sHostToVerifySSL(""),
       m_ssTrustedFingerprints(),
-      m_ssCertVerificationErrors() {
+      m_ssCertVerificationErrors(),
+      m_uProxyPort(0),
+      m_uProxyTargetPort(0) {
 #ifdef HAVE_LIBSSL
     DisableSSLCompression();
     FollowSSLCipherServerPreference();
@@ -61,7 +66,9 @@ CZNCSock::CZNCSock(const CString& sHost, u_short port, int timeout)
     : Csock(sHost, port, timeout),
       m_sHostToVerifySSL(""),
       m_ssTrustedFingerprints(),
-      m_ssCertVerificationErrors() {
+      m_ssCertVerificationErrors(),
+      m_uProxyPort(0),
+      m_uProxyTargetPort(0) {
 #ifdef HAVE_LIBSSL
     DisableSSLCompression();
     FollowSSLCipherServerPreference();
@@ -183,6 +190,213 @@ void CZNCSock::SetEncoding(const CString& sEncoding) {
 #ifdef HAVE_ICU
     Csock::SetEncoding(CZNC::Get().FixupEncoding(sEncoding));
 #endif
+}
+
+void CZNCSock::SetProxy(const CString& sHostname, unsigned short uPort,
+                        const CString& sType) {
+    m_sProxyHostname = sHostname;
+    m_uProxyPort = uPort;
+    m_sProxyType = sType;
+    m_sProxyType.MakeLower();
+    if (m_sProxyType != "socks5" && m_sProxyType != "socks4a") {
+        m_sProxyType = "socks5";
+    }
+}
+
+void CZNCSock::SetProxyTarget(const CString& sHostname, unsigned short uPort,
+                              bool bSSL) {
+    m_sProxyTargetHostname = sHostname;
+    m_uProxyTargetPort = uPort;
+    m_bProxyTargetSSL = bSSL;
+    m_iProxyState = 0;
+    m_bProxyConnected = false;
+    m_sProxyBuffer.clear();
+}
+
+void CZNCSock::ProxyError(const CString& sError) {
+    errno = ECONNREFUSED;
+    SetIsConnected(false);
+    SetConState(Csock::CST_CONNECTWAIT);
+    CallSockError(ECONNREFUSED, sError);
+    Close();
+}
+
+CString CZNCSock::BuildProxyRequest() const {
+    CString sRequest;
+
+    if (m_sProxyType.Equals("socks4a")) {
+        sRequest.append(1, '\x04');
+        sRequest.append(1, '\x01');
+        sRequest.append(1, static_cast<char>((m_uProxyTargetPort >> 8) & 0xff));
+        sRequest.append(1, static_cast<char>(m_uProxyTargetPort & 0xff));
+        // 0.0.0.1 tells the SOCKS4 server that a SOCKS4a domain name follows.
+        sRequest.append(1, '\x00');
+        sRequest.append(1, '\x00');
+        sRequest.append(1, '\x00');
+        sRequest.append(1, '\x01');
+        // Empty user id.
+        sRequest.append(1, '\x00');
+        sRequest.append(m_sProxyTargetHostname);
+        sRequest.append(1, '\x00');
+    } else {
+        // SOCKS5 method negotiation: no authentication required.
+        sRequest.append(1, '\x05');
+        sRequest.append(1, '\x01');
+        sRequest.append(1, '\x00');
+    }
+
+    return sRequest;
+}
+
+CString CZNCSock::BuildSocks5ConnectRequest() const {
+    CString sRequest;
+    sRequest.append(1, '\x05');
+    sRequest.append(1, '\x01');
+    sRequest.append(1, '\x00');
+    sRequest.append(1, '\x03');
+
+    size_t uHostLen = m_sProxyTargetHostname.size();
+    if (uHostLen > 255) {
+        uHostLen = 255;
+    }
+    sRequest.append(1, static_cast<char>(uHostLen));
+    sRequest.append(m_sProxyTargetHostname.data(), uHostLen);
+    sRequest.append(1, static_cast<char>((m_uProxyTargetPort >> 8) & 0xff));
+    sRequest.append(1, static_cast<char>(m_uProxyTargetPort & 0xff));
+
+    return sRequest;
+}
+
+cs_ssize_t CZNCSock::Read(char* data, size_t len) {
+    if (!HasProxy() || m_bProxyConnected) {
+        return Csock::Read(data, len);
+    }
+
+    // The TCP connection to the proxy is already established.  Mark it as
+    // connected now, so that Csock does not treat READ_EAGAIN from the proxy
+    // handshake as the TCP connect completion and call Connected() too early.
+    if (!IsConnected()) {
+        SetIsConnected(true);
+    }
+
+    while (true) {
+        if (m_iProxyState == 0) {
+            if (!Write(BuildProxyRequest())) {
+                ProxyError(t_s("SOCKS proxy connection failed"));
+                return Csock::READ_ERR;
+            }
+            m_iProxyState = 1;
+        }
+
+        char szBuffer[1024];
+        cs_ssize_t iBytes = Csock::Read(szBuffer, sizeof(szBuffer));
+        if (iBytes <= 0) {
+            return iBytes;
+        }
+        m_sProxyBuffer.append(szBuffer, iBytes);
+
+        if (m_sProxyType.Equals("socks5")) {
+            if (m_iProxyState == 1) {
+                if (m_sProxyBuffer.size() < 2) {
+                    return Csock::READ_EAGAIN;
+                }
+
+                const unsigned char uVersion =
+                    static_cast<unsigned char>(m_sProxyBuffer[0]);
+                const unsigned char uMethod =
+                    static_cast<unsigned char>(m_sProxyBuffer[1]);
+                m_sProxyBuffer.erase(0, 2);
+
+                if (uVersion != 0x05 || uMethod != 0x00) {
+                    ProxyError(t_s("SOCKS5 proxy rejected the selected authentication method"));
+                    return Csock::READ_ERR;
+                }
+
+                if (!Write(BuildSocks5ConnectRequest())) {
+                    ProxyError(t_s("SOCKS proxy connection failed"));
+                    return Csock::READ_ERR;
+                }
+                m_iProxyState = 2;
+                continue;
+            }
+
+            // m_iProxyState == 2: parse the SOCKS5 connect reply.
+            if (m_sProxyBuffer.size() < 4) {
+                return Csock::READ_EAGAIN;
+            }
+
+            const unsigned char uVersion =
+                static_cast<unsigned char>(m_sProxyBuffer[0]);
+            const unsigned char uReply =
+                static_cast<unsigned char>(m_sProxyBuffer[1]);
+            const unsigned char uAtyp =
+                static_cast<unsigned char>(m_sProxyBuffer[3]);
+
+            size_t uAddrLen = 0;
+            if (uAtyp == 0x01) {
+                uAddrLen = 4;
+            } else if (uAtyp == 0x04) {
+                uAddrLen = 16;
+            } else if (uAtyp == 0x03) {
+                if (m_sProxyBuffer.size() < 5) {
+                    return Csock::READ_EAGAIN;
+                }
+                uAddrLen = static_cast<unsigned char>(m_sProxyBuffer[4]);
+            } else {
+                ProxyError(t_s("SOCKS5 proxy returned an invalid address type"));
+                return Csock::READ_ERR;
+            }
+
+            const size_t uReplyLen = 4 + (uAtyp == 0x03 ? 1 + uAddrLen : uAddrLen) + 2;
+            if (m_sProxyBuffer.size() < uReplyLen) {
+                return Csock::READ_EAGAIN;
+            }
+            m_sProxyBuffer.erase(0, uReplyLen);
+
+            if (uVersion != 0x05 || uReply != 0x00) {
+                ProxyError(t_s("SOCKS5 proxy could not connect to the target server"));
+                return Csock::READ_ERR;
+            }
+            m_bProxyConnected = true;
+        } else {
+            // SOCKS4a reply: 8 bytes, 0x00 0x5A followed by port/address.
+            if (m_sProxyBuffer.size() < 8) {
+                return Csock::READ_EAGAIN;
+            }
+
+            const unsigned char uVersion =
+                static_cast<unsigned char>(m_sProxyBuffer[0]);
+            const unsigned char uStatus =
+                static_cast<unsigned char>(m_sProxyBuffer[1]);
+            m_sProxyBuffer.erase(0, 8);
+
+            if (uVersion != 0x00 || uStatus != 0x5A) {
+                ProxyError(t_s("SOCKS4a proxy could not connect to the target server"));
+                return Csock::READ_ERR;
+            }
+            m_bProxyConnected = true;
+        }
+
+        if (m_bProxyConnected) {
+            break;
+        }
+    }
+
+    // The SOCKS handshake is complete.  Now set up the real connection state.
+    // For SSL targets the TLS handshake starts after this, exactly as it would
+    // for a direct connection.
+    SetSSL(m_bProxyTargetSSL);
+    SetConState(m_bProxyTargetSSL ? Csock::CST_CONNECTSSL : Csock::CST_OK);
+    Connected();
+
+    if (!m_sProxyBuffer.empty()) {
+        const size_t uCopy = std::min(m_sProxyBuffer.size(), len);
+        memcpy(data, m_sProxyBuffer.data(), uCopy);
+        m_sProxyBuffer.erase(0, uCopy);
+        return static_cast<cs_ssize_t>(uCopy);
+    }
+
+    return Csock::READ_EAGAIN;
 }
 
 #ifdef HAVE_PTHREAD
@@ -397,15 +611,25 @@ void CSockManager::Connect(const CString& sHostname, u_short iPort,
                            const CString& sSockName, int iTimeout, bool bSSL,
                            const CString& sBindHost, CZNCSock* pcSock) {
     m_InFlightDnsSockets[pcSock] = false;
+
+    CString sConnectHostname = sHostname;
+    u_short uConnectPort = iPort;
     if (pcSock) {
         pcSock->SetHostToVerifySSL(sHostname);
+        if (pcSock->HasProxy()) {
+            pcSock->SetProxyTarget(sHostname, iPort, bSSL);
+            sConnectHostname = pcSock->GetProxyHostname();
+            uConnectPort = pcSock->GetProxyPort();
+        }
     }
+
 #ifdef HAVE_THREADED_DNS
-    DEBUG("TDNS: initiating resolving of [" << sHostname << "] and bindhost ["
-                                            << sBindHost << "]");
+    DEBUG("TDNS: initiating resolving of [" << sConnectHostname
+                                            << "] and bindhost [" << sBindHost
+                                            << "]");
     TDNSTask* task = new TDNSTask;
-    task->sHostname = sHostname;
-    task->iPort = iPort;
+    task->sHostname = sConnectHostname;
+    task->iPort = uConnectPort;
     task->sSockName = sSockName;
     task->iTimeout = iTimeout;
     task->bSSL = bSSL;
@@ -419,8 +643,8 @@ void CSockManager::Connect(const CString& sHostname, u_short iPort,
     StartTDNSThread(task, false);
 #else /* HAVE_THREADED_DNS */
     // Just let Csocket handle DNS itself
-    FinishConnect(sHostname, iPort, sSockName, iTimeout, bSSL, sBindHost,
-                  pcSock);
+    FinishConnect(sConnectHostname, uConnectPort, sSockName, iTimeout, bSSL,
+                  sBindHost, pcSock);
 #endif
 }
 
@@ -442,10 +666,15 @@ void CSockManager::FinishConnect(const CString& sHostname, u_short iPort,
         // impossible
     }
 
+    const bool bProxy = pcSock && pcSock->HasProxy();
+
     CSConnection C(sHostname, iPort, iTimeout);
 
     C.SetSockName(sSockName);
-    C.SetIsSSL(bSSL);
+    // When a SOCKS proxy is used the TCP connection to the proxy itself is
+    // always plaintext.  If the target connection is SSL, CZNCSock starts
+    // the TLS handshake after the SOCKS handshake has completed.
+    C.SetIsSSL(bSSL && !bProxy);
     C.SetBindHost(sBindHost);
 #ifdef HAVE_LIBSSL
     CString sCipher = CZNC::Get().GetSSLCiphers();
@@ -453,6 +682,9 @@ void CSockManager::FinishConnect(const CString& sHostname, u_short iPort,
         sCipher = ZNC_DefaultCipher();
     }
     C.SetCipher(sCipher);
+    if (bProxy && bSSL) {
+        pcSock->SetCipher(sCipher);
+    }
 #endif
 
     TSocketManager<CZNCSock>::Connect(C, pcSock);
@@ -546,6 +778,12 @@ bool CSocket::Connect(const CString& sHostname, unsigned short uPort, bool bSSL,
         CIRCNetwork* pNetwork = m_pModule->GetNetwork();
         if (pNetwork) {
             sBindHost = pNetwork->GetBindHost();
+            if (pNetwork->HasProxy()) {
+                SetProxy(pNetwork->GetProxyHost(), pNetwork->GetProxyPort(),
+                         pNetwork->GetProxyType());
+            } else {
+                ClearProxy();
+            }
         }
     }
 

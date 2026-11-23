@@ -243,6 +243,14 @@ class CIRCNetwork : private CCoreTranslationMixin {
     const CString& GetEncoding() const;
     CString GetQuitMsg() const;
 
+    bool HasProxy() const { return !m_sProxyHost.empty(); }
+    const CString& GetProxyHost() const { return m_sProxyHost; }
+    unsigned short GetProxyPort() const { return m_uProxyPort; }
+    const CString& GetProxyType() const { return m_sProxyType; }
+    void SetProxy(const CString& sHost, unsigned short uPort,
+                  const CString& sType = "socks5");
+    void ClearProxy();
+
     void SetNick(const CString& s);
     void SetAltNick(const CString& s);
     void SetIdent(const CString& s);
@@ -296,6 +304,9 @@ class CIRCNetwork : private CCoreTranslationMixin {
     CString m_sBindHost;
     CString m_sEncoding;
     CString m_sQuitMsg;
+    CString m_sProxyHost;
+    unsigned short m_uProxyPort = 0;
+    CString m_sProxyType = "socks5";
     SCString m_ssTrustedFingerprints;
 
     CModules* m_pModules;

@@ -30,6 +30,18 @@ class CZNCSock : public Csock, protected CCoreTranslationMixin {
     CZNCSock(const CString& sHost, u_short port, int timeout = 60);
     ~CZNCSock() {}
 
+    cs_ssize_t Read(char* data, size_t len) override;
+
+    void SetProxy(const CString& sHostname, unsigned short uPort,
+                  const CString& sType = "socks5");
+    void ClearProxy() { SetProxy("", 0); }
+    void SetProxyTarget(const CString& sHostname, unsigned short uPort,
+                        bool bSSL);
+    bool HasProxy() const { return !m_sProxyHostname.empty(); }
+    const CString& GetProxyHostname() const { return m_sProxyHostname; }
+    unsigned short GetProxyPort() const { return m_uProxyPort; }
+    const CString& GetProxyType() const { return m_sProxyType; }
+
     int ConvertAddress(const struct sockaddr_storage* pAddr, socklen_t iAddrLen,
                        CString& sIP, u_short* piPort) const override;
 #ifdef HAVE_LIBSSL
@@ -67,11 +79,25 @@ class CZNCSock : public Csock, protected CCoreTranslationMixin {
     };
 
   private:
+    void ProxyError(const CString& sError);
+    CString BuildProxyRequest() const;
+    CString BuildSocks5ConnectRequest() const;
+
     CString m_sHostToVerifySSL;
     SCString m_ssTrustedFingerprints;
     SCString m_ssCertVerificationErrors;
     bool m_bTrustAllCerts = false;
     bool m_bTrustPKI = true;
+
+    CString m_sProxyHostname;
+    unsigned short m_uProxyPort = 0;
+    CString m_sProxyType = "socks5";
+    CString m_sProxyTargetHostname;
+    unsigned short m_uProxyTargetPort = 0;
+    bool m_bProxyTargetSSL = false;
+    int m_iProxyState = 0;
+    bool m_bProxyConnected = false;
+    CString m_sProxyBuffer;
 };
 
 enum EAddrType { ADDR_IPV4ONLY, ADDR_IPV6ONLY, ADDR_ALL };

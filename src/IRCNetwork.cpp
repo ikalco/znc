@@ -137,6 +137,9 @@ CIRCNetwork::CIRCNetwork(CUser* pUser, const CString& sName)
       m_sBindHost(""),
       m_sEncoding(""),
       m_sQuitMsg(""),
+      m_sProxyHost(""),
+      m_uProxyPort(0),
+      m_sProxyType("socks5"),
       m_ssTrustedFingerprints(),
       m_pModules(new CModules),
       m_vClients(),
@@ -201,6 +204,15 @@ void CIRCNetwork::Clone(const CIRCNetwork& Network, bool bCloneName) {
     SetBindHost(Network.GetBindHost());
     SetEncoding(Network.GetEncoding());
     SetQuitMsg(Network.GetQuitMsg());
+    // The proxy is normally applied by the socks module when it is loaded.
+    // Copy it here as well, because a clone does not reload modules whose
+    // arguments did not change.
+    if (Network.GetModules().FindModule("socks")) {
+        SetProxy(Network.GetProxyHost(), Network.GetProxyPort(),
+                 Network.GetProxyType());
+    } else {
+        ClearProxy();
+    }
     m_ssTrustedFingerprints = Network.m_ssTrustedFingerprints;
 
     // Servers
@@ -1347,6 +1359,10 @@ bool CIRCNetwork::Connect() {
     pIRCSock->SetTrustAllCerts(GetTrustAllCerts());
     pIRCSock->SetTrustPKI(GetTrustPKI());
 
+    if (HasProxy() && !pServer->IsUnixSocket()) {
+        pIRCSock->SetProxy(GetProxyHost(), GetProxyPort(), GetProxyType());
+    }
+
     DEBUG("Connecting user/network [" << m_pUser->GetUsername() << "/"
                                       << m_sName << "]");
 
@@ -1548,6 +1564,23 @@ void CIRCNetwork::SetBindHost(const CString& s) {
     } else {
         m_sBindHost = s;
     }
+}
+
+void CIRCNetwork::SetProxy(const CString& sHost, unsigned short uPort,
+                           const CString& sType) {
+    m_sProxyHost = sHost;
+    m_uProxyPort = uPort;
+    m_sProxyType = sType;
+    m_sProxyType.MakeLower();
+    if (m_sProxyType != "socks5" && m_sProxyType != "socks4a") {
+        m_sProxyType = "socks5";
+    }
+}
+
+void CIRCNetwork::ClearProxy() {
+    m_sProxyHost.clear();
+    m_uProxyPort = 0;
+    m_sProxyType = "socks5";
 }
 
 void CIRCNetwork::SetEncoding(const CString& s) {
